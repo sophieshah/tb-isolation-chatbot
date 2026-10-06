@@ -1,0 +1,12 @@
+pypdf
+PyMuPDF
+pdfplumber
+pytesseract
+Pillow
+spacy
+tiktoken
+sentence-transformers
+qdrant-client
+openai
+python-dotenv
+numpy
