@@ -1,0 +1,782 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import express from "express";
+import { readFile } from "node:fs/promises";
+import { prepareAgentMessages } from "./agent.js";
+import { createChatRouter } from "./chat-router.js";
+import { chunkDocumentPages, chunkText, stablePointId } from "./documents.js";
+import { extractCase, formatDecisionSupport } from "./decision-support.js";
+import { searchGuidance } from "./retrieval.js";
+import { QdrantClient } from "./qdrant.js";
+import { runRuleEngine } from "./rule-engine.js";
+import { logRagStep } from "./trace.js";
+
+if (!process.env.NODE_ENV) process.env.NODE_ENV = "test";
+
+async function withChatServer({
+  openai,
+  qdrant,
+  embedQuery = async () => [0.1, 0.2],
+}, run) {
+  const app = express();
+  app.use(express.json());
+  app.use(createChatRouter({ openai, qdrant, embedQuery, model: "test-model" }));
+
+  const server = app.listen(0);
+  await new Promise((resolve) => server.once("listening", resolve));
+  const address = server.address();
+  try {
+    await run(`http://127.0.0.1:${address.port}`);
+  } finally {
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+  }
+}
+
+async function loadExampleCase() {
+  return JSON.parse(await readFile(
+    new URL("../../tb_isolation_rules_package/example_input.json", import.meta.url),
+    "utf8",
+  ));
+}
+
+test("RAG tracing includes development details and suppresses them in production", () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalConsoleLog = console.log;
+  const output = [];
+  console.log = (...args) => output.push(args.join(" "));
+
+  try {
+    process.env.NODE_ENV = "development";
+    logRagStep("Extracted case.", { community_risk: "moderate" });
+    assert.match(output[0], /Extracted case/);
+    assert.match(output[0], /community_risk/);
+
+    output.length = 0;
+    process.env.NODE_ENV = "production";
+    logRagStep("Sensitive production detail.", { community_risk: "high" });
+    assert.deepEqual(output, []);
+  } finally {
+    console.log = originalConsoleLog;
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
+  }
+});
+
+test("chunkText keeps chunks within configured length and applies overlap", () => {
+  const chunks = chunkText("abcdefghij klmnopqrst uvwxyz", {
+    maxChars: 12,
+    overlapChars: 3,
+  });
+
+  assert.ok(chunks.length > 1);
+  assert.ok(chunks.every((chunk) => chunk.length <= 12));
+  assert.match(chunks[0], /^abcdefghij/);
+  assert.ok(chunks.some((chunk) => chunk.includes("uvwxyz")));
+});
+
+test("chunkText returns no chunks for empty input and validates options", () => {
+  assert.deepEqual(chunkText("  \n "), []);
+  assert.throws(() => chunkText("text", { maxChars: 4, overlapChars: 4 }), /overlapChars/);
+});
+
+test("chunkDocumentPages preserves PDF page references", () => {
+  const chunks = chunkDocumentPages([
+    { pageNumber: 2, text: "Guidance from page two." },
+    { pageNumber: 3, text: "Guidance from page three." },
+  ]);
+
+  assert.deepEqual(chunks.map((chunk) => chunk.pageNumber), [2, 3]);
+});
+
+test("stablePointId returns a deterministic UUID", () => {
+  const first = stablePointId("guide.pdf", 3, "passage");
+  assert.equal(first, stablePointId("guide.pdf", 3, "passage"));
+  assert.match(first, /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+});
+
+test("ensureCollection creates a missing collection with configured dimensions", async () => {
+  const calls = [];
+  const qdrant = new QdrantClient({
+    url: "http://qdrant.test",
+    collection: "test-guides",
+    dimensions: 3,
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      if (calls.length === 1) return new Response("", { status: 404 });
+      return new Response(JSON.stringify({ result: { status: "ok" } }), { status: 200 });
+    },
+  });
+
+  await qdrant.ensureCollection();
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].options.method, "PUT");
+  assert.deepEqual(JSON.parse(calls[1].options.body), {
+    vectors: { size: 3, distance: "Cosine" },
+  });
+});
+
+test("ensureCollection rejects an existing collection with incompatible dimensions", async () => {
+  const qdrant = new QdrantClient({
+    dimensions: 3,
+    fetchImpl: async () => new Response(JSON.stringify({
+      result: { config: { params: { vectors: { size: 4 } } } },
+    }), { status: 200 }),
+  });
+
+  await assert.rejects(qdrant.ensureCollection(), /expected 3/);
+});
+
+test("search sends vector and limit and returns ranked matches", async () => {
+  let requestBody;
+  const qdrant = new QdrantClient({
+    fetchImpl: async (_url, options) => {
+      requestBody = JSON.parse(options.body);
+      return new Response(JSON.stringify({ result: [{ id: "point-1", score: 0.9 }] }), {
+        status: 200,
+      });
+    },
+  });
+
+  const matches = await qdrant.search([0.1, 0.2], 5);
+
+  assert.deepEqual(requestBody, { vector: [0.1, 0.2], limit: 5, with_payload: true });
+  assert.deepEqual(matches, [{ id: "point-1", score: 0.9 }]);
+});
+
+test("retrieval uses the configured local query embedding and the Python index payload shape", async () => {
+  let queriedVector;
+  const evidence = await searchGuidance({
+    embedQuery: async (query) => {
+      assert.equal(query, "Should the patient remain isolated?");
+      return [0.1, 0.2];
+    },
+    qdrant: {
+      search: async (vector) => {
+        queriedVector = vector;
+        return [{
+          id: "point-python",
+          score: 0.88,
+          payload: {
+            content: "Evidence from the Python PDF index.",
+            document_name: "Guideline.pdf",
+            document_id: "doc-123",
+            page: 8,
+            parent_id: "parent-1",
+          },
+        }];
+      },
+    },
+    query: "Should the patient remain isolated?",
+  });
+
+  assert.deepEqual(queriedVector, [0.1, 0.2]);
+  assert.equal(evidence[0].text, "Evidence from the Python PDF index.");
+  assert.equal(evidence[0].title, "Guideline.pdf");
+  assert.equal(evidence[0].sourceFile, "Guideline.pdf");
+  assert.equal(evidence[0].pageNumber, 8);
+});
+
+test("agent performs one initial search and at most one model-requested follow-up", async () => {
+  const embeddingInputs = [];
+  let searchCount = 0;
+  const openai = {
+    chat: {
+      completions: {
+        create: async () => ({
+          choices: [{
+            message: {
+              tool_calls: [{
+                id: "call-follow-up",
+                type: "function",
+                function: {
+                  name: "search_tb_guidance",
+                  arguments: JSON.stringify({ query: "isolation discontinuation criteria" }),
+                },
+              }],
+            },
+          }],
+        }),
+      },
+    },
+  };
+  const qdrant = {
+    search: async () => {
+      searchCount += 1;
+      return [{
+        id: `point-${searchCount}`,
+        score: 0.9,
+        payload: {
+          title: "Guideline",
+          source_file: "guideline.pdf",
+          chunk_index: searchCount,
+          text: `Evidence ${searchCount}`,
+        },
+      }];
+    },
+  };
+
+  const result = await prepareAgentMessages({
+    openai,
+    qdrant,
+    model: "test-model",
+    request: {
+      message: "When may isolation stop?",
+      patientContext: "Sensitive patient detail",
+      structuredData: {},
+      conversationHistory: [],
+      embedQuery: async (query) => {
+        embeddingInputs.push(query);
+        return [0.1, 0.2];
+      },
+    },
+  });
+
+  assert.equal(searchCount, 2);
+  assert.deepEqual(embeddingInputs, [
+    "When may isolation stop?",
+    "isolation discontinuation criteria",
+  ]);
+  assert.deepEqual(result.evidence.map((item) => item.reference), ["S1", "S2"]);
+});
+
+test("chat route streams an answer followed by its source citation", async () => {
+  let embeddedQuery;
+  let generatedMessages;
+  const openai = {
+    chat: {
+      completions: {
+        create: async (request) => {
+          if (request.response_format?.json_schema?.name === "tb_task_classification") {
+            return { choices: [{ message: { content: JSON.stringify({ task: "guidance" }) } }] };
+          }
+          if (!request.stream) {
+            generatedMessages = request.messages;
+            return { choices: [{ message: {} }] };
+          }
+          return {
+            async *[Symbol.asyncIterator]() {
+              yield { choices: [{ delta: { content: "Guidance summary." } }] };
+            },
+          };
+        },
+      },
+    },
+  };
+  const qdrant = {
+    search: async () => [{
+      id: "source-1",
+      score: 0.95,
+      payload: {
+        text: "Isolation guidance evidence.",
+        source_file: "guideline.pdf",
+        title: "TB Guideline",
+        chunk_index: 0,
+        page_number: 7,
+      },
+    }],
+  };
+
+  await withChatServer({
+    openai,
+    qdrant,
+    embedQuery: async (query) => {
+      embeddedQuery = query;
+      return [0.1, 0.2];
+    },
+  }, async (url) => {
+    const response = await fetch(`${url}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: "When can isolation end?",
+        patientContext: "private context",
+      }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type"), /text\/plain/);
+    assert.equal(
+      await response.text(),
+      "Guidance summary.\n\nSources:\n[S1] TB Guideline — guideline.pdf, page 7",
+    );
+  });
+
+  assert.deepEqual(embeddedQuery, "When can isolation end?");
+  assert.ok(generatedMessages.some((item) => item.content?.includes("private context")));
+});
+
+test("chat route validates input and returns a no-evidence fallback", async () => {
+  let embeddingCalls = 0;
+  let generatedCalls = 0;
+  const openai = {
+    chat: {
+      completions: {
+        create: async (request) => {
+          if (request.response_format?.json_schema?.name === "tb_task_classification") {
+            return { choices: [{ message: { content: JSON.stringify({ task: "guidance" }) } }] };
+          }
+          generatedCalls += 1;
+          return { choices: [{ message: {} }] };
+        },
+      },
+    },
+  };
+  const qdrant = { search: async () => [] };
+
+  await withChatServer({
+    openai,
+    qdrant,
+    embedQuery: async () => {
+      embeddingCalls += 1;
+      return [0.1, 0.2];
+    },
+  }, async (url) => {
+    const invalid = await fetch(`${url}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "   " }),
+    });
+    assert.equal(invalid.status, 400);
+
+    const noEvidence = await fetch(`${url}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "Question without indexed evidence" }),
+    });
+    assert.equal(noEvidence.status, 200);
+    assert.match(await noEvidence.text(), /couldn't find supporting TB guidance/i);
+  });
+
+  assert.equal(embeddingCalls, 1);
+  assert.equal(generatedCalls, 1);
+});
+
+test("Python bridge validates and evaluates the existing deterministic case schema", async () => {
+  const caseData = await loadExampleCase();
+  const validated = await runRuleEngine({ action: "validate", caseData });
+  const evaluated = await runRuleEngine({ action: "evaluate", caseData: validated.case });
+
+  assert.equal(validated.case.setting, "community");
+  assert.equal(evaluated.result.ruleset_version, "0.1.0-draft");
+  assert.ok(["none", "moderate", "extensive"].includes(evaluated.result.isolation_level));
+  assert.ok(Array.isArray(evaluated.result.release_blockers));
+});
+
+test("Python schema validation errors are returned instead of silently defaulted", async () => {
+  const caseData = await loadExampleCase();
+  caseData.smear = "positive";
+  await assert.rejects(
+    runRuleEngine({ action: "validate", caseData }),
+    /smear must be one of/,
+  );
+});
+
+test("decision formatter directly answers from each deterministic rule status", () => {
+  const base = {
+    isolation_level: "moderate",
+    release_blockers: [],
+    duration: {},
+  };
+  const format = (decision_status, result = {}) => formatDecisionSupport({
+    caseData: {},
+    conflictedFields: [],
+    result: { ...base, decision_status, ...result },
+    review: { assessment: "supported" },
+    evidence: [],
+  });
+
+  assert.match(
+    format("continue_to_conditional_target", {
+      duration: { remaining_days_if_conditions_remain_met: 9 },
+    }),
+    /Rule-engine answer: Continue moderate community restrictions to the rule engine's conditional treatment target\. The rule engine reports 9 verified effective treatment day\(s\) remain/,
+  );
+  assert.match(
+    format("hold_pending_reassessment", { duration: { reassess_within_days: 1 } }),
+    /Rule-engine answer: Maintain the moderate provisional hold pending reassessment\. Reassessment is due within 1 day/,
+  );
+  assert.match(
+    format("eligible_to_discontinue_under_draft_policy"),
+    /Rule-engine answer: The rule engine classifies this case as eligible to discontinue community restrictions/,
+  );
+  assert.match(
+    format("no_community_restrictions", { isolation_level: "none" }),
+    /Rule-engine answer: The rule engine classifies this case as having no community restrictions/,
+  );
+  assert.match(
+    format("out_of_scope_provisional_hold", { isolation_level: "extensive" }),
+    /outside the rule engine's community-setting scope\. It returned an extensive provisional hold, not a setting-specific decision/,
+  );
+});
+
+test("structured extraction preserves explicit frontend form selections", async () => {
+  const caseData = await loadExampleCase();
+  caseData.pretreatment_burden = "low";
+  caseData.community_risk = "low";
+  caseData.patient_harm = "low";
+  caseData.resistance_suspected = "no";
+  caseData.gxp_mtb = "unknown";
+  caseData.rifampin = "unknown";
+
+  const openai = {
+    chat: {
+      completions: {
+        create: async () => ({
+          choices: [{
+            message: {
+              content: JSON.stringify({
+                case: caseData,
+                confirmed_unknown_fields: [],
+                conflicted_fields: [],
+              }),
+            },
+          }],
+        }),
+      },
+    },
+  };
+  const extraction = await extractCase({
+    openai,
+    model: "test-model",
+    request: {
+      message: "Use the values entered in the case form.",
+      patientContext: "",
+      structuredData: {
+        bacterialBurden: "High",
+        geneXpert: "Positive (rifampin resistant)",
+        communityRisk: "Medium",
+        patientHarm: "High",
+        drugResistance: "Yes",
+      },
+      conversationHistory: [],
+    },
+  });
+
+  assert.equal(extraction.caseData.pretreatment_burden, "high");
+  assert.equal(extraction.caseData.gxp_mtb, "detected");
+  assert.equal(extraction.caseData.rifampin, "resistant");
+  assert.equal(extraction.caseData.community_risk, "moderate");
+  assert.equal(extraction.caseData.patient_harm, "high");
+  assert.equal(extraction.caseData.resistance_suspected, "yes");
+});
+
+test("decision route asks for unresolved required fields before evaluating rules", async () => {
+  const caseData = await loadExampleCase();
+  caseData.community_risk = "unknown";
+  let searches = 0;
+  const openai = {
+    chat: {
+      completions: {
+        create: async (request) => {
+          if (request.response_format?.json_schema?.name === "tb_task_classification") {
+            return { choices: [{ message: { content: JSON.stringify({ task: "isolation_decision" }) } }] };
+          }
+          if (request.response_format?.json_schema?.name === "tb_case_extraction") {
+            return {
+              choices: [{
+                message: {
+                  content: JSON.stringify({
+                    case: caseData,
+                    confirmed_unknown_fields: [],
+                    conflicted_fields: [],
+                  }),
+                },
+              }],
+            };
+          }
+          throw new Error("Decision should not reach evidence review before required data is complete.");
+        },
+      },
+    },
+  };
+  const qdrant = {
+    search: async () => {
+      searches += 1;
+      return [];
+    },
+  };
+
+  await withChatServer({ openai, qdrant }, async (url) => {
+    const response = await fetch(`${url}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "Should this patient discontinue community restrictions?" }),
+    });
+
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    assert.match(body, /community exposure risk/i);
+    assert.match(body, /run the deterministic case rules/i);
+  });
+
+  assert.equal(searches, 0);
+});
+
+test("decision clarification replies are routed back into extraction and reach the rule engine", async () => {
+  const completeCase = { ...(await loadExampleCase()), community_risk: "moderate" };
+  const incompleteCase = { ...completeCase, community_risk: "unknown" };
+  let classificationCalls = 0;
+  let extractionCalls = 0;
+  let secondExtractionContext;
+  const openai = {
+    chat: {
+      completions: {
+        create: async (request) => {
+          const name = request.response_format?.json_schema?.name;
+          if (name === "tb_task_classification") {
+            classificationCalls += 1;
+            return { choices: [{ message: { content: JSON.stringify({ task: "isolation_decision" }) } }] };
+          }
+          if (name === "tb_case_extraction") {
+            extractionCalls += 1;
+            const context = JSON.parse(request.messages[1].content);
+            if (extractionCalls === 1) {
+              assert.equal(context.pending_case_clarification, null);
+              return {
+                choices: [{
+                  message: {
+                    content: JSON.stringify({
+                      case: incompleteCase,
+                      confirmed_unknown_fields: [],
+                      conflicted_fields: [],
+                    }),
+                  },
+                }],
+              };
+            }
+
+            secondExtractionContext = context;
+            return {
+              choices: [{
+                message: {
+                  content: JSON.stringify({
+                    case: completeCase,
+                    confirmed_unknown_fields: [],
+                    conflicted_fields: [],
+                  }),
+                },
+              }],
+            };
+          }
+          throw new Error(`Unexpected model call: ${name}`);
+        },
+      },
+    },
+  };
+  const qdrant = { search: async () => [] };
+
+  await withChatServer({ openai, qdrant }, async (url) => {
+    const firstResponse = await fetch(`${url}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "Should this patient continue community restrictions?" }),
+    });
+    const clarification = await firstResponse.text();
+    assert.equal(firstResponse.status, 200);
+    assert.match(clarification, /community exposure risk/i);
+
+    const followUpAnswer = "Community risk is moderate.";
+    const secondResponse = await fetch(`${url}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: followUpAnswer,
+        conversationHistory: [
+          { role: "user", content: "Should this patient continue community restrictions?" },
+          { role: "assistant", content: clarification },
+        ],
+      }),
+    });
+    const decision = await secondResponse.text();
+    assert.equal(secondResponse.status, 200);
+    assert.match(decision, /^Decision:\nRule-engine answer:/);
+    assert.match(decision, /Community risk: moderate/i);
+    assert.doesNotMatch(decision, /Before I can run the deterministic case rules/);
+  });
+
+  assert.equal(classificationCalls, 1, "a pending clarification should bypass reclassification");
+  assert.equal(extractionCalls, 2);
+  assert.deepEqual(secondExtractionContext.pending_case_clarification.user_responses, [
+    "Community risk is moderate.",
+  ]);
+  assert.match(secondExtractionContext.pending_case_clarification.prompt, /community exposure risk/i);
+});
+
+test("decision route preserves Python rule output and adds evidence review/citations", async () => {
+  const caseData = await loadExampleCase();
+  const responseNames = [];
+  let searchCount = 0;
+  const openai = {
+    chat: {
+      completions: {
+        create: async (request) => {
+          const name = request.response_format?.json_schema?.name;
+          if (name) responseNames.push(name);
+          if (name === "tb_task_classification") {
+            return { choices: [{ message: { content: JSON.stringify({ task: "isolation_decision" }) } }] };
+          }
+          if (name === "tb_case_extraction") {
+            return {
+              choices: [{
+                message: {
+                  content: JSON.stringify({
+                    case: caseData,
+                    confirmed_unknown_fields: [],
+                    conflicted_fields: [],
+                  }),
+                },
+              }],
+            };
+          }
+          if (name === "tb_decision_evidence_review") {
+            return {
+              choices: [{
+                message: {
+                  content: JSON.stringify({
+                    assessment: "supported",
+                    follow_up_query: "",
+                    summary: "The guidance is consistent.",
+                  }),
+                },
+              }],
+            };
+          }
+          throw new Error(`Unexpected model call: ${name}`);
+        },
+      },
+    },
+  };
+  const qdrant = {
+    search: async () => {
+      searchCount += 1;
+      return [{
+        id: "decision-source",
+        score: 0.95,
+        payload: {
+          text: "Retrieved TB isolation passage.",
+          source_file: "guide.pdf",
+          title: "TB Guidance",
+          chunk_index: 4,
+          page_number: 12,
+        },
+      }];
+    },
+  };
+
+  await withChatServer({ openai, qdrant }, async (url) => {
+    const response = await fetch(`${url}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "Should the patient continue community restrictions?" }),
+    });
+
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    assert.match(body, /^Decision:\nRule-engine answer: Continue moderate community restrictions to the rule engine's conditional treatment target\./);
+    assert.match(body, /Classification: moderate \(status: continue_to_conditional_target\)/);
+    assert.match(body, /Why\?\nThe deterministic rule engine classified the case as moderate under/);
+    assert.match(body, /Restrict high-risk shared-air activities/);
+    assert.match(body, /Known case facts:\n- /);
+    assert.match(body, /Unresolved criteria:\n/);
+    assert.match(
+      body,
+      /Evidence\nRetrieved guidance supports the rule-engine result \(continue_to_conditional_target\) and does not directly contradict it\. The rule engine has not established eligibility to discontinue restrictions\. The rule-engine result is unchanged\./,
+    );
+    assert.match(body, /Important\nThis is the deterministic rule-engine result and supporting evidence—not an independent clinical recommendation\./);
+    assert.match(body, /\[S1\] TB Guidance — guide\.pdf, page 12/);
+    assert.ok(body.indexOf("Decision:") < body.indexOf("Why?"));
+    assert.ok(body.indexOf("Why?") < body.indexOf("Known case facts:"));
+    assert.ok(body.indexOf("Known case facts:") < body.indexOf("Unresolved criteria:"));
+    assert.ok(body.indexOf("Unresolved criteria:") < body.indexOf("Evidence"));
+    assert.ok(body.indexOf("Evidence") < body.indexOf("Important"));
+  });
+
+  assert.equal(searchCount, 1);
+  assert.ok(responseNames.includes("tb_task_classification"));
+  assert.ok(responseNames.includes("tb_case_extraction"));
+});
+
+test("decision evidence conflict triggers one follow-up retrieval without changing rule output", async () => {
+  const caseData = await loadExampleCase();
+  let searchCount = 0;
+  let reviewCount = 0;
+  const openai = {
+    chat: {
+      completions: {
+        create: async (request) => {
+          const name = request.response_format?.json_schema?.name;
+          if (name === "tb_task_classification") {
+            return { choices: [{ message: { content: JSON.stringify({ task: "isolation_decision" }) } }] };
+          }
+          if (name === "tb_case_extraction") {
+            return {
+              choices: [{
+                message: {
+                  content: JSON.stringify({
+                    case: caseData,
+                    confirmed_unknown_fields: [],
+                    conflicted_fields: [],
+                  }),
+                },
+              }],
+            };
+          }
+          if (name === "tb_decision_evidence_review") {
+            reviewCount += 1;
+            return {
+              choices: [{
+                message: {
+                  content: JSON.stringify({
+                    assessment: "conflict",
+                    follow_up_query: reviewCount === 1 ? "verify isolation duration guidance" : "",
+                    summary: "Source evidence conflicts with the draft rule.",
+                  }),
+                },
+              }],
+            };
+          }
+          throw new Error(`Unexpected model call: ${name}`);
+        },
+      },
+    },
+  };
+  const qdrant = {
+    search: async () => {
+      searchCount += 1;
+      return [{
+        id: `conflict-source-${searchCount}`,
+        score: 0.9,
+        payload: {
+          text: `Evidence passage ${searchCount}`,
+          source_file: "guideline.pdf",
+          title: "TB Guideline",
+          chunk_index: searchCount,
+        },
+      }];
+    },
+  };
+  const expectedRuleResult = await runRuleEngine({ action: "evaluate", caseData });
+
+  await withChatServer({ openai, qdrant }, async (url) => {
+    const response = await fetch(`${url}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "Should restrictions continue for this case?" }),
+    });
+
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    assert.match(
+      body,
+      /Retrieved guidance was assessed as directly conflicting with the rule-engine result \(continue_to_conditional_target\)\. The rule engine has not established eligibility to discontinue restrictions\. The rule-engine result is unchanged\./,
+    );
+    assert.match(body, new RegExp(`Classification: ${expectedRuleResult.result.isolation_level}`));
+    assert.match(body, /\[S2\] TB Guideline/);
+  });
+
+  assert.equal(searchCount, 2);
+  assert.equal(reviewCount, 2);
+});

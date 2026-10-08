@@ -1,99 +1,118 @@
 # TB Isolation Chatbot
 
-This project contains a Node.js backend that talks to OpenAI and a React front-end in the `frontend/` folder. The frontend sends chat requests to `http://localhost:3001/api/chat`, so the backend must be running before you open the app.
+The existing React frontend is retained. Its chat requests continue to use `POST /api/chat` and stream plain text. The Express backend now routes general TB questions to Qdrant RAG and case-specific isolation questions through structured extraction, Python schema validation, the deterministic Python rule engine, and evidence review.
+
+> **Clinical safety:** the rules in `tb_isolation_rules_package/` identify themselves as a draft, not clinically validated policy. Their results are reproducible, not clinically certain. Do not use them to make patient-care decisions without review and approval by qualified TB clinicians and public-health authorities. The engine does not grant healthcare or congregate-facility clearance.
 
 ## Prerequisites
 
-- Node.js 18+
-- npm
-- An OpenAI API key
-- An OpenAI prompt ID and vector store ID for the TB workflow
+- Node.js 20.16 or newer and npm
+- Python 3.10 or newer
+- Docker Desktop with Docker Compose, or a reachable Qdrant Cloud collection
+- An OpenAI API key for task classification, case extraction, and answer generation
+- The Python packages in `backend/requirements.txt` for local embeddings and PDF ingestion
 
-## 1) Configure environment variables
+The Qdrant collection must use the same local embedding model and vector dimension as document ingestion. The default is `intfloat/e5-large-v2`, 1024 dimensions. A local `.venv` is detected automatically; otherwise set `PYTHON_EXECUTABLE` in the environment or ensure `python` is on `PATH`.
 
-Create a `.env` file in the project root (or use the `backend/.env.example` template as a reference) with the following values:
+## Configure and start Qdrant
+
+At the repository root, copy the environment template if needed:
+
+```powershell
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+```
+
+Set `OPENAI_API_KEY` and `QDRANT_URL` in `.env`. For local development, use:
 
 ```env
-OPENAI_API_KEY=your_openai_api_key
-OPENAI_PROMPT_ID=your_prompt_id
-OPENAI_VECTOR_STORE_ID=your_vector_store_id
+OPENAI_MODEL=gpt-4o-mini
+EMBEDDING_MODEL=intfloat/e5-large-v2
+EMBEDDING_DIMENSION=1024
+QDRANT_URL=http://127.0.0.1:6333
+QDRANT_COLLECTION=tb_guidance
+NODE_KNOWLEDGE_DIR=knowledge-base
 PORT=3001
 ```
 
-If you are using the `backend` folder directly, copy the example file:
+Start local Qdrant:
 
-```bash
-cd backend
-copy .env.example .env
+```powershell
+docker compose up -d
 ```
 
-Then edit the copied `.env` file and fill in the values.
+The Qdrant data is stored in a named Docker volume. Cloud deployments should set the Qdrant URL and API key in the server environment; never put the key in frontend code.
 
-## 2) Install dependencies
+## Install dependencies and index guidance
 
-From the repository root:
+Install Node and Python packages:
 
-```bash
+```powershell
 npm install
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
 ```
 
-Or, if you are running the backend from the `backend` directory:
+The repository includes source PDFs in `documents/`. Index them with the existing Python PDF pipeline, which uses the same E5 embeddings as query-time retrieval:
 
-```bash
-cd backend
-npm install
+```powershell
+.\.venv\Scripts\python.exe backend\ingest.py documents
 ```
 
-## 3) Start the backend
+This PDF pipeline may use the configured OpenAI vision model when `ENABLE_VISION=true`; review its settings and costs before ingestion. For additional `.pdf`, `.md`, or `.txt` documents in `knowledge-base/` (the `NODE_KNOWLEDGE_DIR` default), the Node ingestion command uses the same local embedding worker:
 
-From the repo root:
+```powershell
+npm run ingest
+```
 
-```bash
+Changing `EMBEDDING_MODEL` or `EMBEDDING_DIMENSION` requires re-indexing with that same model and dimension. The backend checks the Qdrant collection dimension and will fail startup on a mismatch rather than search with incompatible vectors.
+
+## Run the application
+
+Open two terminals at the repository root.
+
+Terminal 1 — backend:
+
+```powershell
 npm start
 ```
 
-Or from the backend folder:
+At startup the API validates Qdrant and loads the local embedding model. Terminal 2 — unchanged React frontend:
 
-```bash
-cd backend
-npm start
+```powershell
+npm run dev
 ```
 
-This starts the Express server on:
+Open the Vite URL printed in the terminal (normally `http://localhost:5173`). The API listens on `http://localhost:3001`.
 
-```text
-http://localhost:3001
+## Backend request flow
+
+The current frontend request shape is preserved: `message`, `patientContext`, `structuredData`, and `conversationHistory`.
+
+1. The model classifies a turn as a case-specific isolation decision or a general guidance question.
+2. General questions follow the existing bounded RAG flow.
+3. For an isolation decision, the model extracts only user-provided facts into `tb_isolation_rules_package/input_schema.json`. Current form selections are preserved as explicit values.
+4. The case is validated and normalized by the Python rule package. Invalid fields produce an explicit service error; they are not converted into safe-looking defaults.
+5. Before evaluation, the backend asks follow-up questions for required values that are missing or conflicting. A reply to a pending rule-engine clarification is automatically routed back through case extraction; the exact prior question and user's follow-up replies are provided so short or numbered answers can be mapped to the requested fields. If a value is explicitly unknown, that uncertainty is passed to the rules.
+6. The Python engine produces the deterministic level, status, duration, blockers, and rule IDs. Only after that result exists does the backend retrieve Qdrant evidence. It may make one focused follow-up search if the evidence review finds a gap or conflict.
+7. Decision-support replies use fixed `Decision`, `Why?`, `Known case facts`, `Unresolved criteria`, `Evidence`, and `Important` sections. The `Decision` section translates the Python engine's status into a direct statement such as continuing restrictions to its conditional target, maintaining a provisional hold, or eligibility to discontinue under draft policy. The rationale and action come only from the rule result; evidence status is reported separately with retrieved citations. No generative answer step can replace or compete with the rule result.
+
+The backend currently invokes the Python rule bridge and uses a persistent local sentence-transformer worker. Patient context is supplied only for the active request; it is not added to the Qdrant knowledge collection.
+
+In development, the backend writes `[tb-rag]` console traces for classification, extracted case fields, schema validation, deterministic rule results, RAG retrieval and evidence review, and the assembled response. Case details may contain sensitive health information; use synthetic cases for development and protect terminal output. These detailed traces are suppressed when `NODE_ENV=production` or `NODE_ENV=test`. The deterministic rule engine remains the sole source of case-specific isolation decisions; RAG only checks and reports supporting, insufficient, or conflicting evidence.
+
+## Tests
+
+Run the Node/RAG/API tests and the deterministic rule-engine suite:
+
+```powershell
+npm test
+npm run build
 ```
 
-The app exposes the chat endpoint at:
+The rule package can also be tested directly:
 
-```text
-http://localhost:3001/api/chat
+```powershell
+python -m unittest discover -s tb_isolation_rules_package -p test_tb_isolation_rules.py
 ```
 
-## 4) Start the frontend
-
-The repo includes the React source files in `frontend/`, but it does not include a full frontend package setup. If you want to run the UI locally, initialize a small React/Vite app from that folder and serve it:
-
-```bash
-cd frontend
-npm init -y
-npm install react react-dom vite
-npx vite --host
-```
-
-Then open the local URL shown in the terminal (usually `http://localhost:5173`) in your browser.
-
-Important: keep the backend running on port 3001 while using the frontend.
-
-## Common issues
-
-- If the backend fails to start, make sure `.env` contains valid `OPENAI_API_KEY`, `OPENAI_PROMPT_ID`, and `OPENAI_VECTOR_STORE_ID` values.
-- If the UI cannot send messages, confirm the backend is running and that the frontend is hitting `http://localhost:3001/api/chat`.
-- If you see CORS errors, make sure the backend is running with `cors` enabled and that the frontend is not pointing to a different port.
-
-## Project notes
-
-- The backend is the main executable application for the chat API.
-- The frontend is a separate UI layer that calls the backend API.
-- The app is designed for the TB isolation workflow and uses the OpenAI vector store for retrieval.
+Before any clinical use, domain experts must validate the rule policy, extraction behavior, retrieval quality, citation accuracy, and evidence-conflict handling. Review privacy, access control, and logging before sending real patient information to any model or hosted service.

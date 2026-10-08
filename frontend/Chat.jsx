@@ -130,7 +130,7 @@ export default function Chat({ onBackToHome }) {
         const chunk = decoder.decode(value, { stream: true });
         aiMessage.content += chunk;
         
-        if (isFirstChunk && aiMessage.content.trim().length > 0 && !aiMessage.content.includes('file_search')) {
+        if (isFirstChunk && aiMessage.content.trim().length > 0) {
           setHelpPanel(prev => ({
             ...prev,
             messages: [{ ...aiMessage }]
@@ -207,7 +207,7 @@ export default function Chat({ onBackToHome }) {
         const chunk = decoder.decode(value, { stream: true });
         aiMessage.content += chunk;
         
-        if (isFirstChunk && aiMessage.content.trim().length > 0 && !aiMessage.content.includes('file_search')) {
+        if (isFirstChunk && aiMessage.content.trim().length > 0) {
           setHelpPanel(prev => ({
             ...prev,
             messages: [...prev.messages.slice(0, -1), { ...aiMessage }]
@@ -290,7 +290,7 @@ export default function Chat({ onBackToHome }) {
         const chunk = decoder.decode(value, { stream: true });
         aiMessage.content += chunk;
         
-        if (isFirstChunk && aiMessage.content.trim().length > 0 && !aiMessage.content.includes('file_search')) {
+        if (isFirstChunk && aiMessage.content.trim().length > 0) {
           setMessages(prev => [...prev.slice(0, -1), { ...aiMessage }]);
           isFirstChunk = false;
         } else if (!isFirstChunk) {
