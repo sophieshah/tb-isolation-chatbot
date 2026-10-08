@@ -1,0 +1,37 @@
+{
+  "ruleset_version": "0.1.0-draft",
+  "policy": "case_informed_draft",
+  "clinical_validation_status": "draft_not_validated",
+  "isolation_level": "moderate",
+  "decision_status": "continue_to_conditional_target",
+  "duration": {
+    "clock": "verified_uninterrupted_effective_treatment_days",
+    "conditional_target_total_days": 14,
+    "credited_effective_days": 5,
+    "remaining_days_if_conditions_remain_met": 9,
+    "fixed_release_date": null,
+    "reassess_within_days": 7
+  },
+  "normalized_assessment": {
+    "pretreatment_burden": "high",
+    "burden_used_for_policy": "high",
+    "community_risk": "high",
+    "community_used_for_policy": "high",
+    "patient_harm": "moderate",
+    "effective_treatment_verified": true
+  },
+  "rule_ids": [
+    "D03_CASE_INFORMED_HIGH_COMMUNITY",
+    "D05_SPECIAL_EXPOSURE_EXTENSION",
+    "L06_TARGETED_RESTRICTIONS_DURING_TREATMENT"
+  ],
+  "release_blockers": [],
+  "notes": [],
+  "support_domains": [
+    "financial_harm"
+  ],
+  "expert_review_required": false,
+  "restriction_definition": "Restrict high-risk shared-air activities; allow individually planned low-risk activities with mitigation.",
+  "facility_clearance_granted": false,
+  "llm_contract": "Explain this structured decision and unresolved inputs. Do not remove blockers, invent treatment credit, or silently change the level/duration. Record any clinician-approved deviation separately."
+}

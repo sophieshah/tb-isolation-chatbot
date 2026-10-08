@@ -3,18 +3,19 @@ import sys
 import json
 import re
 import hashlib
-import argparse
+import uuid
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 import fitz  # PyMuPDF
 import pdfplumber
 import pytesseract
-
 from PIL import Image
 
 import spacy
 import tiktoken
+
+from openai import OpenAI
 
 from sentence_transformers import SentenceTransformer
 
@@ -23,76 +24,102 @@ from qdrant_client.models import (
     VectorParams,
     Distance,
     PointStruct,
+    Filter,
+    FieldCondition,
+    MatchValue,
 )
 
 from dotenv import load_dotenv
 
 
 # ============================================================
-# Configuration
+# CONFIGURATION
 # ============================================================
 
 load_dotenv()
 
-QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
-COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "documents")
+QDRANT_URL = os.getenv(
+    "QDRANT_URL",
+    "http://localhost:6333"
+)
+
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+
+COLLECTION_NAME = "tb_guidance"
 
 EMBEDDING_MODEL_NAME = os.getenv(
     "EMBEDDING_MODEL",
     "intfloat/e5-large-v2"
 )
 
+OPENAI_MODEL = os.getenv(
+    "OPENAI_VISION_MODEL",
+    "gpt-5"
+)
+
+ENABLE_VISION = (
+    os.getenv("ENABLE_VISION", "true").lower() == "true"
+)
+
 CHUNK_SIZE = 450
 CHUNK_OVERLAP = 75
 
-IMAGE_DPI = 200
+PARENT_CHUNK_SIZE = 1000
+PARENT_CHUNK_OVERLAP = 100
 
-# E5-large-v2 embedding dimension
+IMAGE_DPI = 180
+
 EMBEDDING_DIMENSION = 1024
 
+BATCH_SIZE = 32
+
+pytesseract.pytesseract.tesseract_cmd = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+)
+
 
 # ============================================================
-# Models
+# MODELS / CLIENTS
 # ============================================================
 
-print("Loading NLP model...", file=sys.stderr)
+print("Loading NLP models...", file=sys.stderr)
 
 nlp = spacy.load("en_core_web_sm")
 
 tokenizer = tiktoken.get_encoding("cl100k_base")
 
-print(
-    f"Loading embedding model: {EMBEDDING_MODEL_NAME}",
-    file=sys.stderr
-)
-
 embedding_model = SentenceTransformer(
     EMBEDDING_MODEL_NAME
 )
 
-
-# ============================================================
-# Qdrant
-# ============================================================
-
 qdrant = QdrantClient(
     url=QDRANT_URL,
-    api_key=QDRANT_API_KEY
+    api_key=QDRANT_API_KEY,
+    check_compatibility=False
 )
 
+openai_client = None
+
+if ENABLE_VISION:
+    openai_client = OpenAI(
+        api_key=os.getenv("OPENAI_API_KEY")
+    )
+
+
+# ============================================================
+# QDRANT
+# ============================================================
 
 def ensure_collection():
-    """
-    Create Qdrant collection if it does not already exist.
-    """
 
-    existing = [
-        collection.name
-        for collection in qdrant.get_collections().collections
-    ]
+    collections = qdrant.get_collections()
 
-    if COLLECTION_NAME not in existing:
+    exists = any(
+        collection.name == COLLECTION_NAME
+        for collection in collections.collections
+    )
+
+    if not exists:
 
         qdrant.create_collection(
             collection_name=COLLECTION_NAME,
@@ -106,101 +133,161 @@ def ensure_collection():
             f"Created Qdrant collection: {COLLECTION_NAME}",
             file=sys.stderr
         )
+    # Create payload index for document_id
+    try:
+        qdrant.create_payload_index(
+            collection_name=COLLECTION_NAME,
+            field_name="document_id",
+            field_schema="keyword",
+        )
+
+        print(
+            "Ensured Qdrant index for document_id",
+            file=sys.stderr
+        )
+
+    except Exception as error:
+
+        print(
+            f"Could not create document_id index: {error}",
+            file=sys.stderr
+        )
 
 
 # ============================================================
-# Utility functions
+# TEXT UTILITIES
 # ============================================================
 
 def normalize_text(text: str) -> str:
-    """
-    Clean PDF extraction artifacts.
-    """
 
     if not text:
         return ""
 
-    # Fix common PDF hyphenation
+    text = text.replace("\x00", " ")
+
     text = re.sub(
-        r"(\w)-\s*\n\s*(\w)",
-        r"\1\2",
+        r"[ \t]+",
+        " ",
         text
     )
 
-    # Normalize whitespace
-    text = re.sub(r"[ \t]+", " ", text)
-
-    # Normalize excessive newlines
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text
+    )
 
     return text.strip()
 
 
 def token_count(text: str) -> int:
-    return len(tokenizer.encode(text))
+
+    return len(
+        tokenizer.encode(text)
+    )
 
 
-def generate_id(document_id: str, page: int, index: int) -> str:
-    raw = f"{document_id}:{page}:{index}"
+def generate_uuid(value: str) -> str:
 
-    return hashlib.sha1(
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            value
+        )
+    )
+
+
+def document_id_from_path(path: Path) -> str:
+
+    raw = str(path.resolve())
+
+    return hashlib.sha256(
         raw.encode("utf-8")
-    ).hexdigest()
+    ).hexdigest()[:16]
 
 
 # ============================================================
-# Section detection
+# SECTION DETECTION
 # ============================================================
 
-def detect_section(text: str, current_section: str) -> str:
+def looks_like_heading(text: str) -> bool:
 
-    lines = [
-        line.strip()
-        for line in text.split("\n")
-        if line.strip()
+    text = text.strip()
+
+    if not text:
+        return False
+
+    if len(text) > 180:
+        return False
+
+    patterns = [
+        r"^\d+(\.\d+)*\s+.+",
+        r"^[A-Z][A-Z\s\-:]{5,}$",
+        r"^(Introduction|Background|Methods|Results|Discussion|"
+        r"Conclusion|Recommendations|References)$",
+        r"^(Table|Figure)\s+\d+",
     ]
+
+    return any(
+        re.match(pattern, text)
+        for pattern in patterns
+    )
+
+
+def detect_sections(page_text: str):
+
+    lines = page_text.splitlines()
+
+    current_section = "Unknown"
+
+    sections = []
 
     for line in lines:
 
-        # Examples:
-        #
-        # 1 INTRODUCTION AND SCOPE OF GUIDELINES
-        # 2 EXECUTIVE SUMMARY
-        # 3 BACKGROUND AND RATIONALE
+        line = normalize_text(line)
 
-        if re.match(
-            r"^\d+(\.\d+)*\s+[A-Z][A-Z\s\-—:&]+$",
-            line
-        ):
-            return line
+        if not line:
+            continue
 
-    return current_section
+        if looks_like_heading(line):
+
+            current_section = line
+
+        sections.append(
+            (
+                line,
+                current_section
+            )
+        )
+
+    return sections
 
 
 # ============================================================
-# Sentence-aware chunking
+# SENTENCE CHUNKING
 # ============================================================
 
-def split_into_sentences(text: str) -> List[str]:
+def split_sentences(text: str):
 
     doc = nlp(text)
 
     return [
-        sent.text.strip()
-        for sent in doc.sents
-        if sent.text.strip()
+        sentence.text.strip()
+        for sentence in doc.sents
+        if sentence.text.strip()
     ]
 
 
 def chunk_text(
     text: str,
-    chunk_size: int = CHUNK_SIZE,
-    overlap: int = CHUNK_OVERLAP
-) -> List[str]:
+    max_tokens: int = CHUNK_SIZE,
+    overlap_tokens: int = CHUNK_OVERLAP,
+):
 
-    sentences = split_into_sentences(text)
+    sentences = split_sentences(text)
 
     chunks = []
+
     current = []
     current_tokens = 0
 
@@ -208,41 +295,45 @@ def chunk_text(
 
         sentence_tokens = token_count(sentence)
 
-        # If adding this sentence exceeds the limit,
-        # finish the current chunk.
         if (
             current
-            and current_tokens + sentence_tokens > chunk_size
+            and
+            current_tokens + sentence_tokens > max_tokens
         ):
 
             chunks.append(
                 " ".join(current)
             )
 
-            # Preserve sentence overlap
-            overlap_sentences = []
+            overlap = []
 
-            overlap_tokens = 0
+            overlap_count = 0
 
             for previous in reversed(current):
 
-                previous_tokens = token_count(previous)
+                previous_tokens = token_count(
+                    previous
+                )
 
-                if overlap_tokens + previous_tokens > overlap:
+                if (
+                    overlap_count + previous_tokens
+                    > overlap_tokens
+                ):
                     break
 
-                overlap_sentences.insert(
+                overlap.insert(
                     0,
                     previous
                 )
 
-                overlap_tokens += previous_tokens
+                overlap_count += previous_tokens
 
-            current = overlap_sentences
+            current = overlap
 
-            current_tokens = overlap_tokens
+            current_tokens = overlap_count
 
         current.append(sentence)
+
         current_tokens += sentence_tokens
 
     if current:
@@ -255,447 +346,720 @@ def chunk_text(
 
 
 # ============================================================
-# Table extraction
+# PARENT / CHILD CHUNKING
 # ============================================================
 
-def table_to_markdown(table: List[List[str]]) -> str:
+def create_parent_child_chunks(
+    text: str,
+    document_id: str,
+    page_number: int,
+    section: str,
+):
 
-    if not table:
-        return ""
+    parent_chunks = chunk_text(
+        text,
+        max_tokens=PARENT_CHUNK_SIZE,
+        overlap_tokens=PARENT_CHUNK_OVERLAP
+    )
+
+    results = []
+
+    for parent_index, parent_text in enumerate(
+        parent_chunks
+    ):
+
+        parent_id = generate_uuid(
+            f"{document_id}:parent:{page_number}:{parent_index}"
+        )
+
+        children = chunk_text(
+            parent_text,
+            max_tokens=CHUNK_SIZE,
+            overlap_tokens=CHUNK_OVERLAP
+        )
+
+        parent = {
+            "id": parent_id,
+            "type": "parent",
+            "document_id": document_id,
+            "page": page_number,
+            "section": section,
+            "parent_id": None,
+            "parent_index": parent_index,
+            "content": parent_text,
+        }
+
+        results.append(parent)
+
+        for child_index, child_text in enumerate(
+            children
+        ):
+
+            child_id = generate_uuid(
+                f"{parent_id}:child:{child_index}"
+            )
+
+            results.append({
+                "id": child_id,
+                "type": "child",
+                "document_id": document_id,
+                "page": page_number,
+                "section": section,
+                "parent_id": parent_id,
+                "parent_index": parent_index,
+                "child_index": child_index,
+                "content": child_text,
+            })
+
+    return results
+
+
+# ============================================================
+# TABLE EXTRACTION
+# ============================================================
+
+def clean_table(table):
 
     cleaned = []
 
     for row in table:
 
+        if not row:
+            continue
+
         row = [
-            (cell or "").strip().replace("\n", " ")
+            normalize_text(cell or "")
             for cell in row
         ]
 
+        # Skip completely empty rows
+        if not any(row):
+            continue
+
         cleaned.append(row)
 
-    # Determine maximum number of columns
-    column_count = max(
+    return cleaned
+
+
+def table_to_markdown(table):
+
+    table = clean_table(table)
+
+    if not table:
+        return ""
+
+    width = max(
         len(row)
-        for row in cleaned
+        for row in table
     )
 
     normalized = []
 
-    for row in cleaned:
+    for row in table:
 
         row = row + [""] * (
-            column_count - len(row)
+            width - len(row)
         )
 
         normalized.append(row)
 
     header = normalized[0]
 
-    markdown = []
-
-    markdown.append(
-        "| " + " | ".join(header) + " |"
-    )
-
-    markdown.append(
-        "| " +
-        " | ".join(["---"] * column_count) +
-        " |"
-    )
+    markdown = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(
+            ["---"] * width
+        ) + " |"
+    ]
 
     for row in normalized[1:]:
 
         markdown.append(
-            "| " + " | ".join(row) + " |"
+            "| "
+            + " | ".join(row)
+            + " |"
         )
 
     return "\n".join(markdown)
 
 
-def extract_tables(pdf_path: str) -> Dict[int, List[Dict[str, Any]]]:
+def table_is_valid(table_text: str) -> bool:
 
-    tables_by_page = {}
+    if not table_text:
+        return False
 
-    with pdfplumber.open(pdf_path) as pdf:
+    lines = table_text.splitlines()
 
-        for page_number, page in enumerate(
-            pdf.pages,
-            start=1
-        ):
+    # A valid table should have multiple rows
+    if len(lines) < 3:
+        return False
 
-            tables = page.extract_tables()
+    # It should contain table separators
+    if "|" not in table_text:
+        return False
 
-            if not tables:
-                continue
+    # Reject extremely sparse extraction
+    if len(table_text.strip()) < 80:
+        return False
 
-            page_tables = []
-
-            for table_index, table in enumerate(tables):
-
-                markdown = table_to_markdown(table)
-
-                if not markdown.strip():
-                    continue
-
-                page_tables.append({
-                    "table_index": table_index,
-                    "content": markdown
-                })
-
-            if page_tables:
-                tables_by_page[page_number] = page_tables
-
-    return tables_by_page
+    return True
 
 
 # ============================================================
-# Image extraction + OCR
+# TABLE FALLBACK
 # ============================================================
 
-def extract_images(
-    pdf_path: str,
-    output_dir: Path
-) -> Dict[int, List[Dict[str, Any]]]:
+def render_page_for_table(
+    pdf_page,
+    dpi=IMAGE_DPI
+):
 
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True
+    matrix = fitz.Matrix(
+        dpi / 72,
+        dpi / 72
     )
 
-    images_by_page = {}
+    pixmap = pdf_page.get_pixmap(
+        matrix=matrix,
+        alpha=False
+    )
 
-    doc = fitz.open(pdf_path)
+    return Image.frombytes(
+        "RGB",
+        [
+            pixmap.width,
+            pixmap.height
+        ],
+        pixmap.samples
+    )
 
-    for page_number, page in enumerate(
-        doc,
-        start=1
+
+def extract_table_with_ocr(
+    pdf_page,
+    page_number: int,
+):
+
+    image = render_page_for_table(
+        pdf_page
+    )
+
+    text = pytesseract.image_to_string(
+        image
+    )
+
+    text = normalize_text(text)
+
+    if not text:
+        return None
+
+    return {
+        "table_text": text,
+        "extraction_method": "ocr",
+        "page": page_number,
+    }
+
+
+def extract_tables(
+    pdf_path: Path,
+    pdf_document,
+):
+
+    tables = []
+
+    with pdfplumber.open(
+        pdf_path
+    ) as plumber_pdf:
+
+        for page_index, plumber_page in enumerate(
+            plumber_pdf.pages
+        ):
+
+            page_number = page_index + 1
+
+            extracted = plumber_page.extract_tables()
+
+            valid_tables = []
+
+            for table_index, table in enumerate(
+                extracted or []
+            ):
+
+                markdown = table_to_markdown(
+                    table
+                )
+
+                if table_is_valid(markdown):
+
+                    valid_tables.append({
+                        "table_index": table_index,
+                        "content": markdown,
+                        "method": "pdfplumber",
+                        "page": page_number,
+                    })
+
+            if valid_tables:
+
+                tables.extend(
+                    valid_tables
+                )
+
+            else:
+
+                # ------------------------------------------------
+                # FALLBACK
+                # ------------------------------------------------
+
+                fallback = extract_table_with_ocr(
+                    pdf_document[page_index],
+                    page_number
+                )
+
+                if fallback:
+
+                    tables.append({
+                        "table_index": 0,
+                        "content": fallback["table_text"],
+                        "method": "ocr",
+                        "page": page_number,
+                    })
+
+    return tables
+
+
+# ============================================================
+# FIGURE / IMAGE DETECTION
+# ============================================================
+
+def find_figure_blocks(page):
+
+    blocks = page.get_text(
+        "blocks"
+    )
+
+    figures = []
+
+    for block in blocks:
+
+        if len(block) < 5:
+            continue
+
+        x0, y0, x1, y1, text = block[:5]
+
+        text = normalize_text(text)
+
+        if re.match(
+            r"^(Figure|Fig\.?)\s+\d+",
+            text,
+            re.IGNORECASE
+        ):
+
+            figures.append({
+                "bbox": (
+                    x0,
+                    y0,
+                    x1,
+                    y1
+                ),
+                "caption": text
+            })
+
+    return figures
+
+
+def render_figure_crop(
+    page,
+    bbox,
+    padding=100,
+):
+
+    x0, y0, x1, y1 = bbox
+
+    rect = fitz.Rect(
+        max(0, x0 - padding),
+        max(0, y0 - padding),
+        min(page.rect.width, x1 + padding),
+        min(page.rect.height, y1 + padding)
+    )
+
+    matrix = fitz.Matrix(
+        IMAGE_DPI / 72,
+        IMAGE_DPI / 72
+    )
+
+    pixmap = page.get_pixmap(
+        matrix=matrix,
+        clip=rect,
+        alpha=False
+    )
+
+    return Image.frombytes(
+        "RGB",
+        [
+            pixmap.width,
+            pixmap.height
+        ],
+        pixmap.samples
+    )
+
+
+# ============================================================
+# IMAGE → LLM DESCRIPTION
+# ============================================================
+
+def image_to_base64(image: Image.Image):
+
+    import base64
+    import io
+
+    buffer = io.BytesIO()
+
+    image.save(
+        buffer,
+        format="PNG"
+    )
+
+    return base64.b64encode(
+        buffer.getvalue()
+    ).decode("utf-8")
+
+
+def describe_figure(
+    image: Image.Image,
+    caption: str,
+):
+
+    if not openai_client:
+        return None
+
+    image_base64 = image_to_base64(
+        image
+    )
+
+    prompt = f"""
+You are creating a detailed textual representation of a
+figure from a technical research document for a RAG system.
+
+Figure caption:
+{caption}
+
+Describe this figure in detail so that a text-based retrieval
+system can answer questions about information contained in the
+figure even though the original image will not be stored.
+
+Include:
+
+1. What the figure represents
+2. The purpose of the figure
+3. All major visual elements
+4. Labels and terminology visible in the figure
+5. Relationships between elements
+6. Directional relationships, arrows, flows, or hierarchies
+7. Categories, groups, axes, scales, or levels
+8. Important numbers or values
+9. Trends or comparisons
+10. Any decision logic represented
+11. How the different components relate to one another
+12. Any important information that would be easy to miss
+
+Do not speculate about information that is not visible.
+
+Write a detailed, factual description suitable for embedding
+in a retrieval-augmented generation system.
+"""
+
+    response = openai_client.responses.create(
+        model=OPENAI_MODEL,
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": prompt,
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url":
+                            f"data:image/png;base64,{image_base64}",
+                    },
+                ],
+            }
+        ],
+    )
+
+    return response.output_text.strip()
+
+
+# ============================================================
+# PDF TEXT EXTRACTION
+# ============================================================
+
+def extract_page_text(
+    page
+):
+
+    text = page.get_text(
+        "text"
+    )
+
+    return normalize_text(
+        text
+    )
+
+
+# ============================================================
+# FIGURE EXTRACTION
+# ============================================================
+
+def extract_figures(
+    pdf_document
+):
+
+    figures = []
+
+    for page_index, page in enumerate(
+        pdf_document
     ):
 
-        images = page.get_images(
-            full=True
+        page_number = page_index + 1
+
+        figure_blocks = find_figure_blocks(
+            page
         )
 
-        page_images = []
-
-        for image_index, image in enumerate(images):
-
-            xref = image[0]
+        for figure_index, figure in enumerate(
+            figure_blocks
+        ):
 
             try:
 
-                image_data = doc.extract_image(xref)
-
-                image_bytes = image_data["image"]
-
-                extension = image_data["ext"]
-
-                filename = (
-                    f"page_{page_number}_"
-                    f"image_{image_index}.{extension}"
+                image = render_figure_crop(
+                    page,
+                    figure["bbox"]
                 )
 
-                image_path = (
-                    output_dir / filename
+                description = describe_figure(
+                    image,
+                    figure["caption"]
                 )
 
-                with open(
-                    image_path,
-                    "wb"
-                ) as f:
-                    f.write(image_bytes)
+                if description:
 
-                # OCR
-                pil_image = Image.open(
-                    image_path
-                )
+                    figures.append({
+                        "page": page_number,
+                        "figure_index": figure_index,
+                        "caption": figure["caption"],
+                        "description": description,
+                    })
 
-                ocr_text = pytesseract.image_to_string(
-                    pil_image
-                )
-
-                page_images.append({
-                    "image_index": image_index,
-                    "path": str(image_path),
-                    "ocr_text": normalize_text(
-                        ocr_text
-                    )
-                })
-
-            except Exception as e:
+            except Exception as error:
 
                 print(
-                    f"Image extraction failed "
-                    f"on page {page_number}: {e}",
+                    f"Figure processing failed "
+                    f"on page {page_number}: {error}",
                     file=sys.stderr
                 )
 
-        if page_images:
-            images_by_page[page_number] = page_images
-
-    doc.close()
-
-    return images_by_page
+    return figures
 
 
 # ============================================================
-# PDF page extraction
-# ============================================================
-
-def extract_pages(pdf_path: str):
-
-    doc = fitz.open(pdf_path)
-
-    pages = []
-
-    for page_number, page in enumerate(
-        doc,
-        start=1
-    ):
-
-        text = page.get_text(
-            "text"
-        )
-
-        pages.append({
-            "page": page_number,
-            "text": normalize_text(text)
-        })
-
-    doc.close()
-
-    return pages
-
-
-# ============================================================
-# Build document chunks
+# BUILD DOCUMENT CHUNKS
 # ============================================================
 
 def build_chunks(
-    pdf_path: str,
-    document_id: str,
-    document_name: str
+    pdf_path: Path
 ):
 
-    image_dir = (
-        Path("output")
-        / document_id
-        / "images"
-    )
-
-    pages = extract_pages(
+    document_id = document_id_from_path(
         pdf_path
     )
 
-    tables = extract_tables(
-        pdf_path
-    )
+    document_name = pdf_path.name
 
-    images = extract_images(
-        pdf_path,
-        image_dir
+    pdf_document = fitz.open(
+        pdf_path
     )
 
     chunks = []
 
-    chunk_index = 0
+    # --------------------------------------------------------
+    # NORMAL TEXT
+    # --------------------------------------------------------
 
-    current_section = "Unknown"
+    for page_index, page in enumerate(
+        pdf_document
+    ):
 
-    for page_data in pages:
+        page_number = page_index + 1
 
-        page_number = page_data["page"]
-        page_text = page_data["text"]
+        page_text = extract_page_text(
+            page
+        )
 
         if not page_text:
             continue
 
-        current_section = detect_section(
-            page_text,
-            current_section
-        )
+        section = "Unknown"
 
-        # ----------------------------------------------------
-        # Normal text
-        # ----------------------------------------------------
-
-        text_chunks = chunk_text(
+        detected = detect_sections(
             page_text
         )
 
-        for chunk in text_chunks:
+        if detected:
 
-            chunks.append({
-                "id": generate_id(
-                    document_id,
-                    page_number,
-                    chunk_index
-                ),
+            # Use the final detected section
+            section = detected[-1][1]
 
-                "document_id": document_id,
+        parent_children = create_parent_child_chunks(
+            page_text,
+            document_id,
+            page_number,
+            section,
+        )
+
+        for chunk in parent_children:
+
+            chunk.update({
                 "document_name": document_name,
-
-                "chunk_index": chunk_index,
-
-                "chunk_type": "text",
-
-                "page": page_number,
-
-                "section": current_section,
-
-                "content": chunk,
-
-                "metadata": {
-                    "source": document_name,
-                    "page": page_number,
-                    "section": current_section,
-                    "chunk_type": "text"
-                }
+                "source_type": "pdf",
             })
 
-            chunk_index += 1
-
-        # ----------------------------------------------------
-        # Tables
-        # ----------------------------------------------------
-
-        for table in tables.get(
-            page_number,
-            []
-        ):
-
-            table_number = (
-                table["table_index"]
+            chunks.append(
+                chunk
             )
 
-            content = table["content"]
+    # --------------------------------------------------------
+    # TABLES
+    # --------------------------------------------------------
 
-            chunks.append({
+    tables = extract_tables(
+        pdf_path,
+        pdf_document
+    )
 
-                "id": generate_id(
-                    document_id,
-                    page_number,
-                    chunk_index
-                ),
+    for table in tables:
 
-                "document_id": document_id,
-                "document_name": document_name,
+        page = table["page"]
 
-                "chunk_index": chunk_index,
+        table_content = table["content"]
 
-                "chunk_type": "table",
+        table_id = generate_uuid(
+            f"{document_id}:table:{page}:{table['table_index']}"
+        )
 
-                "page": page_number,
+        chunks.append({
+            "id": table_id,
+            "type": "table",
+            "document_id": document_id,
+            "document_name": document_name,
+            "page": page,
+            "section": f"Table on page {page}",
+            "parent_id": None,
+            "table_index": table["table_index"],
+            "extraction_method": table["method"],
+            "source_type": "table",
+            "content": table_content,
+        })
 
-                "section": current_section,
+    # --------------------------------------------------------
+    # FIGURES
+    # --------------------------------------------------------
 
-                "table_index": table_number,
+    figures = extract_figures(
+        pdf_document
+    )
 
-                "content": content,
+    for figure in figures:
 
-                "metadata": {
-                    "source": document_name,
-                    "page": page_number,
-                    "section": current_section,
-                    "chunk_type": "table",
-                    "table_index": table_number
-                }
-            })
+        page = figure["page"]
 
-            chunk_index += 1
+        figure_index = figure["figure_index"]
 
-        # ----------------------------------------------------
-        # Images
-        # ----------------------------------------------------
+        figure_id = generate_uuid(
+            f"{document_id}:figure:{page}:{figure_index}"
+        )
 
-        for image in images.get(
-            page_number,
-            []
-        ):
+        content = (
+            f"{figure['caption']}\n\n"
+            f"Detailed figure description:\n"
+            f"{figure['description']}"
+        )
 
-            image_content = image[
-                "ocr_text"
-            ]
+        chunks.append({
+            "id": figure_id,
+            "type": "figure",
+            "document_id": document_id,
+            "document_name": document_name,
+            "page": page,
+            "section": figure["caption"],
+            "parent_id": None,
+            "figure_index": figure_index,
+            "source_type": "figure_description",
+            "content": content,
+        })
 
-            if not image_content:
-                image_content = (
-                    "Image/figure extracted "
-                    f"from page {page_number}."
-                )
-
-            chunks.append({
-
-                "id": generate_id(
-                    document_id,
-                    page_number,
-                    chunk_index
-                ),
-
-                "document_id": document_id,
-                "document_name": document_name,
-
-                "chunk_index": chunk_index,
-
-                "chunk_type": "image",
-
-                "page": page_number,
-
-                "section": current_section,
-
-                "image_index": image[
-                    "image_index"
-                ],
-
-                "image_path": image[
-                    "path"
-                ],
-
-                "content": image_content,
-
-                "metadata": {
-                    "source": document_name,
-                    "page": page_number,
-                    "section": current_section,
-                    "chunk_type": "image",
-                    "image_index": image[
-                        "image_index"
-                    ],
-                    "image_path": image[
-                        "path"
-                    ]
-                }
-            })
-
-            chunk_index += 1
+    pdf_document.close()
 
     return chunks
 
 
 # ============================================================
-# E5-large embedding
+# RETRIEVAL TEXT
+# ============================================================
+
+def create_retrieval_text(
+    chunk: Dict[str, Any]
+):
+
+    parts = []
+
+    if chunk.get("document_name"):
+        parts.append(
+            f"Document: {chunk['document_name']}"
+        )
+
+    if chunk.get("section"):
+        parts.append(
+            f"Section: {chunk['section']}"
+        )
+
+    if chunk.get("page"):
+        parts.append(
+            f"Page: {chunk['page']}"
+        )
+
+    if chunk.get("type"):
+        parts.append(
+            f"Content type: {chunk['type']}"
+        )
+
+    parts.append(
+        chunk["content"]
+    )
+
+    return "\n".join(parts)
+
+
+# ============================================================
+# EMBEDDINGS
 # ============================================================
 
 def embed_chunks(
-    chunks: List[Dict[str, Any]]
+    chunks
 ):
 
-    texts = []
-
-    for chunk in chunks:
-
-        # E5 models expect "passage:" for documents
-        text = (
-            "passage: "
-            + chunk["content"]
-        )
-
-        texts.append(text)
+    texts = [
+        "passage: " +
+        create_retrieval_text(chunk)
+        for chunk in chunks
+    ]
 
     embeddings = embedding_model.encode(
         texts,
-        batch_size=32,
+        batch_size=BATCH_SIZE,
+        normalize_embeddings=True,
         show_progress_bar=True,
-        normalize_embeddings=True
     )
 
     for chunk, embedding in zip(
@@ -709,11 +1073,43 @@ def embed_chunks(
 
 
 # ============================================================
-# Upload to Qdrant
+# DELETE EXISTING DOCUMENT
+# ============================================================
+
+def delete_existing_document(
+    document_id: str
+):
+
+    try:
+
+        qdrant.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=Filter(
+                must=[
+                    FieldCondition(
+                        key="document_id",
+                        match=MatchValue(
+                            value=document_id
+                        )
+                    )
+                ]
+            )
+        )
+
+    except Exception as error:
+
+        print(
+            f"Could not delete existing document: {error}",
+            file=sys.stderr
+        )
+
+
+# ============================================================
+# QDRANT UPLOAD
 # ============================================================
 
 def upload_to_qdrant(
-    chunks: List[Dict[str, Any]]
+    chunks
 ):
 
     points = []
@@ -721,118 +1117,63 @@ def upload_to_qdrant(
     for chunk in chunks:
 
         payload = {
-            "document_id": chunk[
-                "document_id"
-            ],
-
-            "document_name": chunk[
-                "document_name"
-            ],
-
-            "chunk_index": chunk[
-                "chunk_index"
-            ],
-
-            "chunk_type": chunk[
-                "chunk_type"
-            ],
-
-            "page": chunk[
-                "page"
-            ],
-
-            "section": chunk[
-                "section"
-            ],
-
-            "content": chunk[
-                "content"
-            ],
-
-            "metadata": chunk[
-                "metadata"
-            ]
+            key: value
+            for key, value in chunk.items()
+            if key != "embedding"
         }
-
-        # Add optional metadata
-        if "table_index" in chunk:
-            payload["table_index"] = (
-                chunk["table_index"]
-            )
-
-        if "image_index" in chunk:
-            payload["image_index"] = (
-                chunk["image_index"]
-            )
-
-        if "image_path" in chunk:
-            payload["image_path"] = (
-                chunk["image_path"]
-            )
 
         points.append(
             PointStruct(
                 id=chunk["id"],
                 vector=chunk["embedding"],
-                payload=payload
+                payload=payload,
             )
         )
 
-    # Upload in batches
-    batch_size = 64
-
-    for i in range(
+    for start in range(
         0,
         len(points),
-        batch_size
+        BATCH_SIZE
     ):
 
         batch = points[
-            i:i + batch_size
+            start:start + BATCH_SIZE
         ]
 
         qdrant.upsert(
             collection_name=COLLECTION_NAME,
-            points=batch
+            points=batch,
         )
 
         print(
-            f"Uploaded {min(i + batch_size, len(points))}"
-            f"/{len(points)} chunks",
+            f"Uploaded {len(batch)} points",
             file=sys.stderr
         )
 
 
 # ============================================================
-# Main ingestion pipeline
+# INGEST ONE DOCUMENT
 # ============================================================
 
-def ingest_document(pdf_path: str):
-
-    pdf_path = Path(pdf_path)
-
-    document_name = pdf_path.name
-
-    document_id = hashlib.sha1(
-        str(pdf_path.resolve()).encode()
-    ).hexdigest()
+def ingest_document(
+    pdf_path: Path
+):
 
     print(
-        f"Processing: {document_name}",
+        f"Processing {pdf_path.name}",
         file=sys.stderr
     )
 
-    ensure_collection()
+    document_id = document_id_from_path(
+        pdf_path
+    )
 
-    print(
-        "Extracting document structure...",
-        file=sys.stderr
+    delete_existing_document(
+        document_id
     )
 
     chunks = build_chunks(
-        str(pdf_path),
-        document_id,
-        document_name
+        pdf_path
     )
 
     print(
@@ -840,87 +1181,97 @@ def ingest_document(pdf_path: str):
         file=sys.stderr
     )
 
-    print(
-        "Generating E5 embeddings...",
-        file=sys.stderr
-    )
-
     chunks = embed_chunks(
         chunks
-    )
-
-    print(
-        "Uploading to Qdrant...",
-        file=sys.stderr
     )
 
     upload_to_qdrant(
         chunks
     )
 
-    # Don't return embeddings to Node
-    # because they can be very large.
-    response_chunks = []
-
-    for chunk in chunks:
-
-        response_chunks.append({
-            "id": chunk["id"],
-            "document_id": chunk[
-                "document_id"
-            ],
-            "page": chunk["page"],
-            "section": chunk["section"],
-            "chunk_type": chunk[
-                "chunk_type"
-            ]
-        })
-
-    result = {
-        "success": True,
+    return {
         "document_id": document_id,
-        "document_name": document_name,
+        "document_name": pdf_path.name,
         "chunks": len(chunks),
-        "chunk_types": {
-            "text": sum(
-                c["chunk_type"] == "text"
-                for c in chunks
-            ),
-            "table": sum(
-                c["chunk_type"] == "table"
-                for c in chunks
-            ),
-            "image": sum(
-                c["chunk_type"] == "image"
-                for c in chunks
-            )
-        },
-        "items": response_chunks
     }
 
-    # IMPORTANT:
-    # stdout contains ONLY JSON so Node.js
-    # can safely parse it.
-    print(
-        json.dumps(result)
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    if len(sys.argv) < 2:
+
+        print(
+            "Usage: python ingest.py <pdf_or_directory>",
+            file=sys.stderr
+        )
+
+        sys.exit(1)
+
+    input_path = Path(
+        sys.argv[1]
     )
 
+    ensure_collection()
 
-# ============================================================
-# CLI
-# ============================================================
+    if input_path.is_file():
+
+        documents = [
+            input_path
+        ]
+
+    else:
+
+        documents = sorted(
+            input_path.glob("*.pdf")
+        )
+
+    if not documents:
+
+        raise RuntimeError(
+            "No PDF documents found."
+        )
+
+    results = []
+    failures = []
+
+    for pdf_path in documents:
+
+        try:
+
+            result = ingest_document(
+                pdf_path
+            )
+
+            results.append(
+                result
+            )
+
+        except Exception as error:
+
+            print(
+                f"FAILED: {pdf_path.name}: {error}",
+                file=sys.stderr
+            )
+
+            failures.append({
+                "document_name": pdf_path.name,
+                "error": str(error),
+            })
+
+    print(
+        json.dumps(
+            {
+                "success": len(failures) == 0,
+                "documents": results,
+                "failures": failures,
+            }
+        )
+    )
+
 
 if __name__ == "__main__":
-
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "pdf",
-        help="Path to PDF document"
-    )
-
-    args = parser.parse_args()
-
-    ingest_document(
-        args.pdf
-    )
+    main()

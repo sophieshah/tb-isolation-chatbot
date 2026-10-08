@@ -1,0 +1,557 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TB community isolation inputs",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "respiratory_tb": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "yes",
+        "no",
+        "unknown",
+        null
+      ]
+    },
+    "pediatric_noninfectious_confirmed": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "yes",
+        "no",
+        "unknown",
+        null
+      ]
+    },
+    "adult_type_disease": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "yes",
+        "no",
+        "unknown",
+        null
+      ]
+    },
+    "cavitation": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "yes",
+        "no",
+        "unknown",
+        null
+      ]
+    },
+    "extensive_radiographic_disease": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "yes",
+        "no",
+        "unknown",
+        null
+      ]
+    },
+    "resistance_suspected": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "yes",
+        "no",
+        "unknown",
+        null
+      ]
+    },
+    "resistance_addressed_by_regimen": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "yes",
+        "no",
+        "unknown",
+        null
+      ]
+    },
+    "on_treatment": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "yes",
+        "no",
+        "unknown",
+        null
+      ]
+    },
+    "regimen_appropriate": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "yes",
+        "no",
+        "unknown",
+        null
+      ]
+    },
+    "effectiveness_assessed": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "yes",
+        "no",
+        "unknown",
+        null
+      ]
+    },
+    "adherence_verified": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "yes",
+        "no",
+        "unknown",
+        null
+      ]
+    },
+    "tolerance_adequate": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "yes",
+        "no",
+        "unknown",
+        null
+      ]
+    },
+    "lab_supports_regimen": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "yes",
+        "no",
+        "unknown",
+        null
+      ]
+    },
+    "adverse_response_explained": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "yes",
+        "no",
+        "unknown",
+        null
+      ]
+    },
+    "vulnerable_contacts": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "yes",
+        "no",
+        "unknown",
+        null
+      ]
+    },
+    "congregate_return": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "yes",
+        "no",
+        "unknown",
+        null
+      ]
+    },
+    "targeted_restrictions_feasible": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "yes",
+        "no",
+        "unknown",
+        null
+      ]
+    },
+    "expert_review_completed": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "yes",
+        "no",
+        "unknown",
+        null
+      ]
+    },
+    "pretreatment_burden": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "low",
+        "moderate",
+        "high",
+        "unknown",
+        null,
+        "medium"
+      ]
+    },
+    "community_risk": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "low",
+        "moderate",
+        "high",
+        "unknown",
+        null,
+        "medium"
+      ]
+    },
+    "patient_harm": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "low",
+        "moderate",
+        "high",
+        "unknown",
+        null,
+        "medium"
+      ]
+    },
+    "financial_harm": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "low",
+        "moderate",
+        "high",
+        "unknown",
+        null,
+        "medium"
+      ]
+    },
+    "housing_harm": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "low",
+        "moderate",
+        "high",
+        "unknown",
+        null,
+        "medium"
+      ]
+    },
+    "food_harm": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "low",
+        "moderate",
+        "high",
+        "unknown",
+        null,
+        "medium"
+      ]
+    },
+    "stigma_harm": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "low",
+        "moderate",
+        "high",
+        "unknown",
+        null,
+        "medium"
+      ]
+    },
+    "mental_health_harm": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "low",
+        "moderate",
+        "high",
+        "unknown",
+        null,
+        "medium"
+      ]
+    },
+    "access_to_care_harm": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "low",
+        "moderate",
+        "high",
+        "unknown",
+        null,
+        "medium"
+      ]
+    },
+    "setting": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "community",
+        "healthcare",
+        "congregate_facility",
+        "unknown",
+        null
+      ]
+    },
+    "smear": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "negative",
+        "scanty",
+        "1+",
+        "2+",
+        "3+",
+        "4+",
+        "unknown",
+        null
+      ]
+    },
+    "cough": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "none",
+        "mild",
+        "frequent",
+        "unknown",
+        null
+      ]
+    },
+    "gxp_mtb": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "detected",
+        "not_detected",
+        "unknown",
+        null
+      ]
+    },
+    "gxp_load": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "trace",
+        "very_low",
+        "low",
+        "medium",
+        "high",
+        "unknown",
+        null
+      ]
+    },
+    "rifampin": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "susceptible",
+        "resistant",
+        "indeterminate",
+        "unknown",
+        null
+      ]
+    },
+    "other_resistance": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "none_detected",
+        "inh",
+        "pza",
+        "other",
+        "unknown",
+        null
+      ]
+    },
+    "clinical_response": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "improving",
+        "stable",
+        "worsening",
+        "asymptomatic",
+        "unknown",
+        null
+      ]
+    },
+    "micro_response": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "improving",
+        "stable",
+        "worsening",
+        "unknown",
+        null
+      ]
+    },
+    "exposure_duration": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "brief",
+        "recurrent",
+        "prolonged",
+        "unknown",
+        null
+      ]
+    },
+    "exposure_proximity": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "distant",
+        "shared_air",
+        "close",
+        "unknown",
+        null
+      ]
+    },
+    "exposure_environment": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "outdoor",
+        "well_ventilated",
+        "poor_ventilation",
+        "unknown",
+        null
+      ]
+    },
+    "new_contacts": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "none",
+        "few",
+        "many",
+        "unknown",
+        null
+      ]
+    },
+    "age_years": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "uninterrupted_effective_days": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "days_since_isolation_started": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "individualized_minimum_days": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "individualized_reason": {
+      "type": "string"
+    }
+  },
+  "description": "Omitted fields remain unknown. Integer durations count completed days of verified uninterrupted effective treatment."
+}
