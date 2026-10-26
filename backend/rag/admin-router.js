@@ -1,10 +1,11 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { copyFile, mkdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import express from "express";
 import multer from "multer";
 import { indexDocument } from "./index-document.js";
 import { titleFromPath } from "./documents.js";
+import { validateInputConfig } from "./input-config.js";
 import {
   readSystemInstructionsFromSource,
   saveSystemInstructionsToSource,
@@ -150,6 +151,80 @@ router.put("/instructions", async (req, res, next) => {
       return res.status(400).json({ error: error.message });
     }
 
+    return next(error);
+  }
+});
+
+router.get("/input-config", async (req, res, next) => {
+  try {
+    res.setHeader("Cache-Control", "no-store");
+    return res.json(await req.app.locals.adminConfig.getInputConfig());
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.put("/input-config", async (req, res, next) => {
+  let validatedConfig;
+  try {
+    validatedConfig = validateInputConfig(req.body);
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+  try {
+    const inputConfig = await req.app.locals.adminConfig.setInputConfig(validatedConfig);
+    return res.json({ success: true, inputConfig });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get("/documents", async (req, res, next) => {
+  try {
+    const documents = await req.app.locals.qdrant.listDocuments();
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({ documents });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.delete("/documents", async (req, res, next) => {
+  const { sourceFile } = req.body || {};
+  if (typeof sourceFile !== "string" || !sourceFile.trim() || sourceFile.length > 1000) {
+    return res.status(400).json({ error: "A valid document source is required." });
+  }
+
+  try {
+    const qdrant = req.app.locals.qdrant;
+    const documents = await qdrant.listDocuments();
+    const document = documents.find((item) => item.sourceFile === sourceFile);
+    if (!document) {
+      return res.status(404).json({ error: "The document is not present in the Qdrant collection." });
+    }
+
+    await qdrant.deleteBySource(sourceFile, document.sourceKey);
+
+    const adminUploadPrefix = "admin_uploads/";
+    if (sourceFile.startsWith(adminUploadPrefix)) {
+      const filename = sourceFile.slice(adminUploadPrefix.length);
+      if (/^[a-z0-9._() -]+\.(pdf|md|txt)$/i.test(filename)) {
+        const uploadDirectory = path.join(req.app.locals.adminConfig.directory, "uploads");
+        const uploadedFiles = await readdir(uploadDirectory).catch((error) => {
+          if (error.code === "ENOENT") return [];
+          throw error;
+        });
+        const uploadedFilename = uploadedFiles.find(
+          (name) => name.toLowerCase() === filename.toLowerCase(),
+        );
+        if (uploadedFilename) {
+          await rm(path.join(uploadDirectory, uploadedFilename), { force: true });
+        }
+      }
+    }
+
+    return res.json({ success: true, sourceFile, message: `Removed ${sourceFile} from Qdrant.` });
+  } catch (error) {
     return next(error);
   }
 });

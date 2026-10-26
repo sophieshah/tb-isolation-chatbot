@@ -103,7 +103,10 @@ export function createChatRouter({
             Buffer.from(JSON.stringify(decision.caseState)).toString("base64url"),
           );
           res.end(decision.decisionText);
-          logRagStep("Overall rules-based case response assembled.", decision.decisionText);
+          logRagStep("Overall rules-based case response assembled."
+            // , decision.decisionText
+          );
+          logRagStep("Response Complete.")
           return;
         }
         responseRequest = {
@@ -134,6 +137,7 @@ export function createChatRouter({
         res.setHeader("Content-Type", "text/plain; charset=utf-8");
         res.setHeader("Cache-Control", "no-cache, no-transform");
         logRagStep("General RAG found no evidence; returning the no-evidence response.");
+        logRagStep("Response Complete.")
         return res.end(NO_EVIDENCE_RESPONSE);
       }
       const stream = await streamAgentAnswer({ openai, model, messages });
@@ -153,12 +157,17 @@ export function createChatRouter({
         }
       }
 
-      logRagStep("Generated general RAG response.", ragOutput);
+      logRagStep("Generated general RAG response."
+        // , ragOutput
+      );
       const sources = formatSourceList(evidence);
       if (!res.destroyed) {
         res.end(sources);
-        logRagStep("Overall general RAG response assembled.", `${ragOutput}${sources}`);
+        logRagStep("Overall general RAG response assembled."
+          // , `${ragOutput}${sources}`
+        );
       }
+      logRagStep("Response Complete.")
     } catch (error) {
       console.error("Chat request failed:", error instanceof Error ? error.message : "Unknown error");
       if (res.headersSent) {
