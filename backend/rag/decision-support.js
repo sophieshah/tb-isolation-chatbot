@@ -142,9 +142,9 @@ const TREATMENT_FIELDS = [
 ];
 
 const CLASSIFIER_INSTRUCTIONS = `Classify what the user is asking the assistant to do now, using the current message as the primary signal:
-- isolation_decision: asks for a case-specific restriction/isolation recommendation, level, whether restrictions can stop/change, or a case decision. Use this even if the same message also supplies/corrects patient facts; the decision workflow must first patch the canonical case from the current message, rerun the engine, and answer the decision request.
+- isolation_decision: asks for a case-specific restriction, isolation recommendation, level, whether restrictions can stop/change, or a case decision. Use this even if the same message also supplies/corrects patient facts; the decision workflow must first patch the canonical case from the current message, rerun the engine, and answer the decision request.
 - case_update: supplies or corrects patient facts for a case without asking a separate informational question or explicit recommendation.
-- guidance: asks a general TB, isolation-terminology, or application-workflow question without adding/correcting patient facts and without requesting an individual decision.
+- guidance: asks a general TB, terminology, or application-workflow question without adding/correcting patient facts and without requesting an individual decision.
 - combined: asks a general informational question and also supplies/corrects patient facts that should update the current/new case. Do not use combined if the question itself asks for an individual restriction decision; use isolation_decision.
 
 An existing canonical case does not by itself make a message a decision request or case update. For a pending clarification, choose case_update only when the current message answers or corrects one or more listed pending fields. An unrelated question while clarification is pending is guidance. Use recent conversation only to understand the current message and whether a clarification is pending; never treat earlier patient narrative or assistant text as new facts. If a user supplies facts and asks a general question, choose combined so the case can be updated and the answer can use the newly evaluated deterministic result.`;
@@ -1201,7 +1201,9 @@ export async function prepareDecisionSupport({
   } else {
     logRagStep("Extracting structured case facts.");
     const extracted = await extractCase({ openai, model, request });
-    logRagStep("Structured case extraction complete.", extracted.caseData);
+    logRagStep("Structured case extraction complete."
+      // , extracted.caseData
+    );
     caseState = {
       schemaVersion: CASE_STATE_SCHEMA_VERSION,
       version: 1,
@@ -1221,17 +1223,24 @@ export async function prepareDecisionSupport({
   const validated = await ruleRunner({ action: "validate", caseData: caseState.case });
   caseState.case = validated.case;
   const caseData = caseState.case;
-  logRagStep("Case schema validation passed.", {
-    confirmedUnknownFields: caseState.confirmedUnknownFields,
-    conflictedFields: caseState.conflictedFields,
-  });
+  logRagStep("Case schema validation passed."
+  //   , {
+  //   confirmedUnknownFields: caseState.confirmedUnknownFields,
+  //   conflictedFields: caseState.conflictedFields,
+  // }
+);
   logRagStep("Running the deterministic Python rule engine.");
   const evaluated = await ruleRunner({ action: "evaluate", caseData });
   if (!evaluated.result || typeof evaluated.result !== "object") {
     throw new Error("Python rule engine returned no deterministic result.");
   }
   const result = evaluated.result;
-  logRagStep("Deterministic rule-engine output.", result);
+  logRagStep("Deterministic rule-engine output.");
+  console.log(
+    typeof result === "string"
+      ? result
+      : JSON.stringify(result, null, 2)
+  );
 
   caseState = attachEngineQuestions(caseState, engineQuestions(result), result.decision_status);
   if (result.decision_status === "needs_input" &&
@@ -1293,7 +1302,9 @@ try {
 }
 
 
-  logRagStep("Rules-based narrative output.", decisionText);
+  logRagStep("Rules-based narrative output."
+    // , decisionText
+  );
 
   return {
     kind: "decision",
