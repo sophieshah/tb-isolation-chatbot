@@ -95,7 +95,7 @@ export function createChatRouter({
           model,
           request: decisionRequest,
         });
-        if (task !== "combined") {
+        if (decision.awaitingClarification) {
           res.setHeader("Content-Type", "text/plain; charset=utf-8");
           res.setHeader("Cache-Control", "no-cache, no-transform");
           res.setHeader(
@@ -111,17 +111,14 @@ export function createChatRouter({
         }
         responseRequest = {
           ...responseRequest,
-          decisionContext: {
-            case: decision.caseState.case,
-            result: decision.result,
-            narrative: decision.decisionText,
-          },
+          structuredData: decision.caseState.case,
+          decisionContext: decision.result,
         };
         res.setHeader(
           "X-TB-Case-State",
           Buffer.from(JSON.stringify(decision.caseState)).toString("base64url"),
         );
-        logRagStep("Updated case result will inform the user's additional question.", {
+        logRagStep("Validated case and rule-engine result will inform the RAG agent.", {
           caseVersion: decision.caseState.version,
           decisionStatus: decision.result.decision_status,
         });
@@ -157,13 +154,13 @@ export function createChatRouter({
         }
       }
 
-      logRagStep("Generated general RAG response."
+      logRagStep("Generated RAG response."
         // , ragOutput
       );
       const sources = formatSourceList(evidence);
       if (!res.destroyed) {
         res.end(sources);
-        logRagStep("Overall general RAG response assembled."
+        logRagStep("Overall RAG response assembled."
           // , `${ragOutput}${sources}`
         );
       }

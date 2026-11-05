@@ -856,8 +856,13 @@ test.skip("legacy clarification flow is superseded by canonical engine-question 
     });
     const decision = await secondResponse.text();
     assert.equal(secondResponse.status, 200);
-    assert.match(decision, /^## Recommendation\nThe deterministic tool result is:/);
-    assert.match(decision, /Continue moderate community restrictions/);
+    assert.match(decision, /Here is the answer using the current information/);
+    const agentUserMessage = capture.guidanceAssessmentMessages
+      .filter((item) => item.role === "user")
+      .map((item) => item.content)
+      .join("\n");
+    assert.match(agentUserMessage, /Deterministic rule-engine output/);
+    assert.match(agentUserMessage, /"restriction_level":/);
     assert.doesNotMatch(decision, /Before I can run the deterministic case rules/);
   });
 
@@ -1259,37 +1264,6 @@ function createRulesOnlyOpenAI({
             };
           }
 
-          if (request.messages[0]?.content?.includes("clinical narrative interpreter")) {
-            capture.narrativeInput = JSON.parse(request.messages[1].content);
-            capture.narrativeInstructions = request.messages[0].content;
-            const { user_question: question, deterministic_engine_output: result } = capture.narrativeInput;
-            const required = capture.narrativeInput.required_clarification_questions || [];
-            const optional = capture.narrativeInput.optional_confirmation_questions || [];
-            const recommendation = result.decision_status === "needs_input"
-              ? `I can't finalize the answer to "${question}" because the deterministic rules returned needs_input; no restriction level or duration has been assigned, and the remaining duration cannot yet be determined.`
-              : `The answer to "${question}" is ${result.restriction_level}; the total target is ${result.expected_days_of_restrictions} treatment days and the conditional remaining interval is ${result.expected_remaining_days} days.`;
-            const text = [
-              "## Recommendation",
-              recommendation,
-              "",
-              "## Why this recommendation",
-              `The rules engine returned ${result.decision_status} and supplied the result shown above.`,
-              "",
-              "## Assumptions and uncertainty",
-              `Reported assumptions: ${JSON.stringify(result.assumptions)}.`,
-              "",
-              "## Reassessment",
-              required.length
-                ? `Required clarification: ${required.map((item) => item.question).join(" ")}`
-                : "Reassess using the supplied rules-engine conditions.",
-              optional.length
-                ? ` Optional confirmations: ${optional.map((item) => item.question).join(" ")}`
-                : "",
-              "The result reflects the supplied rules-engine policy; exact guideline attribution has not been verified.",
-            ].join("\n");
-            return { choices: [{ message: { content: text } }] };
-          }
-
           if (!request.response_format) {
             if (request.stream) {
               capture.guidanceAnswerMessages = request.messages;
@@ -1310,19 +1284,29 @@ function createRulesOnlyOpenAI({
   };
 }
 
-test("rules-only decision narrative preserves the sample engine output and skips Qdrant", async () => {
+test("completed decision passes structured case and rule output to the RAG agent", async () => {
   const sample = await loadExampleCase();
   const initialCase = (await runRuleEngine({ action: "validate", caseData: sample })).case;
   initialCase.pretreatment_burden = "low";
   initialCase.community_risk = "low";
   const capture = {};
   const openai = createRulesOnlyOpenAI({ initialCase, capture });
+  const guidance = {
+    id: "decision-guidance",
+    score: 0.9,
+    payload: {
+      text: "Retrieved guidance for the patient's recommendation.",
+      source_file: "guideline.pdf",
+      title: "TB Guideline",
+      chunk_index: 1,
+      page_number: 4,
+    },
+  };
   let qdrantSearches = 0;
 
   await withChatServer({
     openai,
-    qdrant: { search: async () => { qdrantSearches += 1; return []; } },
-    embedQuery: async () => { throw new Error("Decision support must not retrieve evidence in rules-only mode."); },
+    qdrant: { search: async () => { qdrantSearches += 1; return [guidance]; } },
   }, async (url) => {
     const response = await fetch(`${url}/api/chat`, {
       method: "POST",
@@ -1335,16 +1319,18 @@ test("rules-only decision narrative preserves the sample engine output and skips
 
     assert.equal(response.status, 200);
     const body = await response.text();
-    assert.match(body, /## Provisional TB assessment/);
-    assert.match(body, /Engine-reported restriction level: no restriction/);
-    assert.match(body, /Conditional total effective-treatment target: 5 days/);
-    assert.match(body, /Remaining effective-treatment days: 0/);
-    assert.equal(capture.narrativeInput.deterministic_engine_output.restriction_level, "no restriction");
-    assert.equal(capture.narrativeInput.deterministic_engine_output.expected_days_of_restrictions, 5);
-    assert.equal(capture.narrativeInput.deterministic_engine_output.expected_remaining_days, 0);
-    assert.match(capture.narrativeInstructions, /not universal NTCA guideline requirements/i);
-    assert.match(capture.narrativeInstructions, /assumed adherent.*not.*adherence verified/i);
-    assert.equal(qdrantSearches, 0);
+    assert.match(body, /Here is the answer using the current information/);
+    assert.match(body, /\[S1\] TB Guideline, page 4/);
+    const agentUserMessage = capture.guidanceAssessmentMessages
+      .filter((message) => message.role === "user")
+      .map((message) => message.content)
+      .join("\n");
+    assert.match(agentUserMessage, /Structured patient data:/);
+    assert.match(agentUserMessage, new RegExp(`pretreatment_burden: ${initialCase.pretreatment_burden}`));
+    assert.match(agentUserMessage, /Deterministic rule-engine output/);
+    assert.match(agentUserMessage, /"restriction_level":"no restriction"/);
+    assert.match(capture.guidanceAssessmentMessages[0].content, /supplementary program-specific assessment/i);
+    assert.equal(qdrantSearches, 1);
   });
 });
 
@@ -1357,7 +1343,18 @@ test("engine needs_input questions update the canonical case without re-extracti
   initialCase.community_risk = "unknown";
   const capture = {};
   const openai = createRulesOnlyOpenAI({ initialCase, capture });
-  const qdrant = { search: async () => { throw new Error("Unexpected Qdrant search."); } };
+  const qdrant = {
+    search: async () => [{
+      id: "clarification-guidance",
+      score: 0.9,
+      payload: {
+        text: "Retrieved guidance passage.",
+        source_file: "guide.pdf",
+        title: "TB Guidance",
+        chunk_index: 1,
+      },
+    }],
+  };
 
   await withChatServer({ openai, qdrant }, async (url) => {
     const first = await fetch(`${url}/api/chat`, {
@@ -1375,7 +1372,7 @@ test("engine needs_input questions update the canonical case without re-extracti
     assert.match(firstText, /need you to clarify/i);
     assert.match(firstText, /initial bacterial burden/);
     assert.doesNotMatch(firstText, /is extensive/);
-    assert.equal(capture.narrativeInput, undefined);
+    assert.equal(capture.guidanceAssessmentMessages, undefined);
     assert.ok(firstState.pendingFields.includes("pretreatment_burden"));
     assert.ok(firstState.pendingFields.includes("community_risk"));
     assert.equal(firstState.version, 1);
@@ -1399,7 +1396,7 @@ test("engine needs_input questions update the canonical case without re-extracti
     ).toString("utf8"));
 
     assert.equal(second.status, 200);
-    assert.match(secondText, /Can restrictions be stopped\?/);
+    assert.match(secondText, /Here is the answer using the current information/);
     assert.equal(secondState.case.pretreatment_burden, "low");
     assert.equal(secondState.case.community_risk, "low");
     assert.equal(secondState.version, 2);
@@ -1408,7 +1405,16 @@ test("engine needs_input questions update the canonical case without re-extracti
     assert.ok(firstState.pendingFields.every((field) =>
       capture.updateInput.target_fields.includes(field),
     ));
-    assert.match(capture.narrativeInstructions, /required clarification question verbatim before optional confirmations/i);
+    const agentUserMessage = capture.guidanceAssessmentMessages
+      .filter((item) => item.role === "user")
+      .map((item) => item.content)
+      .join("\n");
+    assert.match(agentUserMessage, /Can restrictions be stopped\?/);
+    assert.match(agentUserMessage, /Deterministic rule-engine output/);
+    assert.match(
+      capture.guidanceAssessmentMessages[0].content,
+      /supplementary program-specific assessment/i,
+    );
   });
 });
 
@@ -1537,10 +1543,10 @@ test("combined fact update and general question use the freshly evaluated determ
     assert.equal(updatedState.version, 9);
     assert.equal(capture.updateInput.current_user_message,
       "The patient has actually completed five days of treatment. How does that affect reassessment?");
-    assert.match(assessmentText, /"treatment_days":5/);
+    assert.match(assessmentText, /treatment_days: 5/);
     assert.match(assessmentText, /expected_days_of_restrictions/);
     assert.match(assessmentText, /How does that affect reassessment/);
-    assert.match(capture.guidanceAnswerMessages[0].content, /restriction level, conditions, and clearance status as authoritative/i);
+    assert.match(capture.guidanceAssessmentMessages[0].content, /supplementary program-specific assessment/i);
   });
 });
 

@@ -6,8 +6,6 @@ import {
 } from "../backend/rag/agent.js";
 import {
   classifyTask,
-  formatDecisionResult,
-  formatDecisionSources,
   prepareDecisionSupport,
 } from "../backend/rag/decision-support.js";
 import { LocalEmbeddingWorker } from "../backend/rag/local-embeddings.js";
@@ -44,12 +42,15 @@ export default async function handler(req, res) {
     patientContext: req.body.patientContext,
     structuredData: req.body.structuredData,
     conversationHistory: req.body.conversationHistory,
+    caseState: req.body.caseState,
   };
 
   try {
     await qdrant.ensureCollection();
     const task = await classifyTask({ openai: client, model, request });
-    if (task === "isolation_decision") {
+    let responseRequest = { ...request, embedQuery };
+    let updatedCaseState;
+    if (["isolation_decision", "case_update", "combined"].includes(task)) {
       const decision = await prepareDecisionSupport({
         openai: client,
         qdrant,
@@ -57,43 +58,38 @@ export default async function handler(req, res) {
         model,
         request,
       });
-      if (decision.kind === "clarification") {
-        return res.status(200).json({ reply: decision.text });
-      }
-
-      const warning = decision.review?.assessment === "conflict"
-        ? "\n\nEvidence consistency: conflict detected. The deterministic result is unchanged; clinician review is needed."
-        : decision.review?.assessment === "insufficient"
-          ? "\n\nEvidence consistency: supporting evidence was insufficient. The deterministic result is unchanged."
-          : "";
-      if (!decision.explanationMessages) {
+      updatedCaseState = decision.caseState;
+      if (decision.awaitingClarification) {
         return res.status(200).json({
-          reply: `${decision.deterministicText}\n\nNo supporting guidance was retrieved for this rule result.`,
+          reply: decision.decisionText,
+          caseState: decision.caseState,
         });
       }
-
-      const response = await client.chat.completions.create({
-        model,
-        messages: decision.explanationMessages,
-      });
-      const explanation = response.choices[0]?.message?.content || "";
-      return res.status(200).json({
-        reply: `${formatDecisionResult(decision.result)}${warning}\n\nExplanation:\n${explanation}${formatDecisionSources(decision.evidence)}`,
-      });
+      responseRequest = {
+        ...responseRequest,
+        structuredData: decision.caseState.case,
+        decisionContext: decision.result,
+      };
     }
 
     const { messages, evidence } = await prepareAgentMessages({
       openai: client,
       qdrant,
       model,
-      request: { ...request, embedQuery },
+      request: responseRequest,
     });
-    if (evidence.length === 0) {
+    if (evidence.length === 0 && !responseRequest.decisionContext) {
       return res.status(200).json({ reply: NO_EVIDENCE_RESPONSE });
     }
     const response = await client.chat.completions.create({ model, messages });
-    const reply = response.choices[0]?.message?.content || "";
-    return res.status(200).json({ reply: `${reply}${formatSourceList(evidence)}` });
+    const reply = response.choices[0]?.message?.content;
+    if (typeof reply !== "string" || !reply.trim()) {
+      throw new Error("The RAG agent returned no response.");
+    }
+    return res.status(200).json({
+      reply: `${reply}${formatSourceList(evidence)}`,
+      ...(updatedCaseState ? { caseState: updatedCaseState } : {}),
+    });
   } catch (error) {
     console.error("Chat handler failed:", error instanceof Error ? error.message : "Unknown error");
     return res.status(502).json({ error: "Unable to process this request." });

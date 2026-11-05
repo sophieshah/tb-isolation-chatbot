@@ -1270,46 +1270,13 @@ export async function prepareDecisionSupport({
     };
   }
 
-  logRagStep(
-    "Passing structured inputs and the deterministic result to the narrative interpreter.",
-    {
-      decisionStatus: result.decision_status,
-      pendingFields: caseState.pendingFields,
-    },
-  );
-
-
-let decisionText;
-
-try {
-  decisionText = await generateRuleNarrative({
-    openai,
-    model,
-    request,
-    caseState,
-    result,
-  });
-} catch (error) {
-  const message =
-    error instanceof Error ? error.message : "Unknown narrative error";
-
-  logRagStep("Narrative generation or validation failed; using safe fallback.", {
+  logRagStep("Returning the structured case and deterministic result to the RAG agent.", {
     decisionStatus: result.decision_status,
-    error: message,
   });
-
-  decisionText = buildSafeDecisionFallback(result);
-}
-
-
-  logRagStep("Rules-based narrative output."
-    // , decisionText
-  );
 
   return {
     kind: "decision",
     decisionStatus: result.decision_status,
-    decisionText,
     caseState,
     result,
     awaitingClarification: false,
