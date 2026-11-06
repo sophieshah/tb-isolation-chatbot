@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import HomePage from "./HomePage";
+import HomePage from "./Homepage";
 import Chat from "./Chat";
 import AdminPanel from "./AdminPanel";
 
